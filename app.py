@@ -17,6 +17,8 @@ import time
 import io
 from datetime import datetime
 
+from bio_utils import parse_fasta, generate_example_fasta, SequenceSummary
+
 # ─────────────────────────────────────────────
 # Page config & custom CSS
 # ─────────────────────────────────────────────
@@ -457,6 +459,7 @@ div[data-testid="stExpander"] {
 DEFAULTS = {
     "file_uploaded": False,
     "file_name": "",
+    "seq_summary": None,  # SequenceSummary from bio_utils
     "gem_generated": False,
     "media_components": [],
     "optimization_run": False,
@@ -557,8 +560,10 @@ def generate_structured_output():
             "timestamp": datetime.now().isoformat(),
             "input": {
                 "file": st.session_state.file_name or "sample_proteome.faa",
-                "type": "Protein FASTA (.faa)",
-                "sequences": 1366,
+                "type": (st.session_state.seq_summary.format
+                         if st.session_state.seq_summary else "Protein FASTA (.faa)"),
+                "sequences": (st.session_state.seq_summary.sequence_count
+                              if st.session_state.seq_summary else 0),
             },
             "model": {
                 "status": "Draft GEM generated",
@@ -670,9 +675,14 @@ with col_upload:
         )
 
         if uploaded_file is not None:
-            st.session_state.file_uploaded = True
-            st.session_state.file_name = uploaded_file.name
-            st.rerun()
+            try:
+                summary = parse_fasta(uploaded_file, uploaded_file.name)
+                st.session_state.file_uploaded = True
+                st.session_state.file_name = uploaded_file.name
+                st.session_state.seq_summary = summary
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
         else:
             st.markdown("""
             <div class="upload-zone">
@@ -683,8 +693,11 @@ with col_upload:
             """, unsafe_allow_html=True)
 
             if st.button("📋 Load Example Dataset", type="secondary", use_container_width=True):
+                example_bytes, example_name = generate_example_fasta()
+                summary = parse_fasta(io.BytesIO(example_bytes), example_name)
                 st.session_state.file_uploaded = True
-                st.session_state.file_name = "E_coli_K12_proteome.faa"
+                st.session_state.file_name = example_name
+                st.session_state.seq_summary = summary
                 st.rerun()
     else:
         st.markdown(f"""
@@ -696,8 +709,14 @@ with col_upload:
 
         st.markdown("")
 
-        # File summary card
+        # File summary card — uses real parsed data
+        summ = st.session_state.seq_summary
         fname = st.session_state.file_name
+        seq_count = f"{summ.sequence_count:,}" if summ else "—"
+        fmt_label = summ.format if summ else "FASTA"
+        size_label = summ.size_label if summ else "—"
+        avg_len = f"{summ.avg_length:.0f}" if summ else "—"
+
         st.markdown(f"""
         <div class="file-summary">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
@@ -705,9 +724,13 @@ with col_upload:
                 <span class="badge badge-green">Ready</span>
             </div>
             <div style="display:flex; gap:2rem; font-size:0.82rem; color:#6b7280;">
-                <span><strong>Type:</strong> Protein FASTA</span>
-                <span><strong>Sequences:</strong> 1,366</span>
-                <span><strong>Size:</strong> 1.4 MB</span>
+                <span><strong>Type:</strong> {fmt_label}</span>
+                <span><strong>Sequences:</strong> {seq_count}</span>
+                <span><strong>Total:</strong> {size_label}</span>
+            </div>
+            <div style="display:flex; gap:2rem; font-size:0.82rem; color:#6b7280; margin-top:0.3rem;">
+                <span><strong>Avg length:</strong> {avg_len} residues</span>
+                <span><strong>Range:</strong> {summ.min_length:,}–{summ.max_length:,}</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1221,39 +1244,40 @@ if st.session_state.optimization_run:
     structured_data = generate_structured_output()
     json_str = json.dumps(structured_data, indent=2)
 
+    # Cache download data in session state to prevent stale media file errors
+    st.session_state["_dl_json"] = json_str
+
+    csv_rows = []
+    for comp in st.session_state.media_components:
+        info = AVAILABLE_COMPONENTS.get(comp["name"], {"unit": "mM"})
+        optimized_qty = round(comp["quantity"] * (0.8 + 0.5 * (results["drivers"].get(comp["name"], 0.3))), 1)
+        csv_rows.append({
+            "Component": comp["name"],
+            "Original_Concentration": comp["quantity"],
+            "Optimized_Concentration": optimized_qty,
+            "Unit": info["unit"],
+            "Recommended_Range": results["ranges"].get(comp["name"], "Medium"),
+            "Sensitivity_Score": results["drivers"].get(comp["name"], 0.0),
+        })
+    csv_df = pd.DataFrame(csv_rows)
+    st.session_state["_dl_csv"] = csv_df.to_csv(index=False)
+
     # Download buttons
     dl_col1, dl_col2, dl_col3 = st.columns([1, 1, 3], gap="medium")
 
     with dl_col1:
         st.download_button(
             "📥 Download JSON",
-            data=json_str,
+            data=st.session_state["_dl_json"],
             file_name="gem_media_optimizer_results.json",
             mime="application/json",
             use_container_width=True,
         )
 
     with dl_col2:
-        # Create CSV from recipe data
-        csv_rows = []
-        for comp in st.session_state.media_components:
-            info = AVAILABLE_COMPONENTS.get(comp["name"], {"unit": "mM"})
-            optimized_qty = round(comp["quantity"] * (0.8 + 0.5 * (results["drivers"].get(comp["name"], 0.3))), 1)
-            csv_rows.append({
-                "Component": comp["name"],
-                "Original_Concentration": comp["quantity"],
-                "Optimized_Concentration": optimized_qty,
-                "Unit": info["unit"],
-                "Recommended_Range": results["ranges"].get(comp["name"], "Medium"),
-                "Sensitivity_Score": results["drivers"].get(comp["name"], 0.0),
-            })
-        csv_df = pd.DataFrame(csv_rows)
-        csv_buffer = io.StringIO()
-        csv_df.to_csv(csv_buffer, index=False)
-
         st.download_button(
             "📥 Download CSV",
-            data=csv_buffer.getvalue(),
+            data=st.session_state["_dl_csv"],
             file_name="gem_media_optimizer_results.csv",
             mime="text/csv",
             use_container_width=True,
